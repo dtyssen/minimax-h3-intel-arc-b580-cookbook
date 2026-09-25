@@ -1,0 +1,88 @@
+# ============================================================
+#  SeedVR2 Upscale Stack — video upscale ZONDER DynamicVRAM
+#
+#  Zelfde Intel Omni-image als de H3-stack, maar met directe
+#  launch i.p.v. het entrypoint: DynamicVRAM/AIMDO is NIET
+#  actief. SeedVR2 3B Int8 (3.3 GB) past volledig in de VRAM,
+#  dus sliding-window staging is onnodig — en de herhaalde
+#  per-chunk re-staging via AIMDO crasht het proces (schone
+#  exit zonder traceback, zie lessons-learned.md).
+#
+#  Deelt models/input/output/user met de H3-stack (zelfde
+#  host-mappen). Draai nooit gelijktijdig met comfyui_h3.
+#
+#  Starten:
+#    docker compose -f compose.h3.yaml down
+#    docker compose -f compose.seedvr2.yaml up -d
+#    -> http://<host>:8390
+#
+#  Terug naar H3:
+#    docker compose -f compose.seedvr2.yaml down
+#    docker compose -f compose.h3.yaml up -d
+# ============================================================
+
+services:
+
+  comfyui_seedvr2:
+    # LET OP: deze stack draait bewust de GEPUBLICEERDE b1-tag, terwijl de
+    # H3-stack de lokale b2-source-build gebruikt (ComfyUI 0.35, /data/...
+    # paden). Reden: b1 heeft de /llm/ComfyUI/...-paden die hierboven
+    # gemonteerd staan, zodat de gedeelde workflow-/modelmappen direct
+    # vindbaar zijn zonder extra CLI-argumenten. Beide stacks delen dezelfde
+    # host-mappen, dus workflows blijven zichtbaar in beide images.
+    image: ${SEEDVR2_IMAGE:-intel/llm-scaler-omni:0.2.0-b1}
+    container_name: comfyui_seedvr2
+    restart: unless-stopped
+
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+
+    ports:
+      - "${SEEDVR2_PORT:-8390}:8188"
+
+    environment:
+      - ONEAPI_DEVICE_SELECTOR=level_zero:0
+      - ZES_ENABLE_SYSMAN=1
+      - OMNIXPU_PROVIDER_BOOTSTRAP=auto
+      - OMNI_ATTN_BACKEND=auto
+      - OMNIXPU_DEBUG_VERBOSE=${H3_DEBUG:-0}
+
+    volumes:
+      - ${MODELS_DIR_H3:-/home/dennis/docker/comfyui_h3/models}:/llm/ComfyUI/models
+      - ${INPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/input}:/llm/ComfyUI/input
+      - ${OUTPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/output}:/llm/ComfyUI/output
+      # H3-output leesbaar maken via input/h3_output, zodat de SeedVR2-workflow
+      # direct MiniMax H3-video's kan inladen zonder handmatig te kopiëren.
+      # LoadVideo node: kies bestand uit de "h3_output/MiniMax_H3/fl2av/" submap.
+      - ${OUTPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/output}:/llm/ComfyUI/input/h3_output:ro
+      - ${USER_DIR_H3:-/home/dennis/docker/comfyui_h3/user}:/llm/ComfyUI/user
+      - ${CUSTOM_NODES_DIR_H3:-/home/dennis/docker/comfyui_h3/custom_nodes}/rgthree-comfy:/llm/ComfyUI/custom_nodes/rgthree-comfy
+      - ${CUSTOM_NODES_DIR_H3:-/home/dennis/docker/comfyui_h3/custom_nodes}/Comfyui_Minimax_h3_latent_Upscaler:/llm/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler
+
+    # Direct launch ZONDER --enable-dynamic-vram:
+    # SeedVR2 3B Int8 (3.3 GB) laadt volledig resident in VRAM.
+    # umask 000: zelfde reden als de H3-stack — output wereld-beschrijfbaar.
+    working_dir: /llm/ComfyUI
+    command: ["sh", "-c", "umask 000 && exec python main.py --listen 0.0.0.0 --port 8188"]
+
+    shm_size: "${H3_SHM_SIZE:-16g}"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8188/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+networks:
+  default:
+    driver: bridge

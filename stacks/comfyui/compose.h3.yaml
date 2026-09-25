@@ -1,0 +1,156 @@
+# ============================================================
+#  ComfyUI H3 Stack — MiniMax H3 op Intel Arc B580
+#
+#  Gebaseerd op Intel's Omni 0.2.0-b2 **source-build** (XPU_TARGET=bmg):
+#  DynamicVRAM (sliding-window VRAM-staging via --enable-dynamic-vram),
+#  ComfyUI-GGUF-XPU voor quant-ondersteuning, native SOL/SLA/VSA sparse
+#  attention en OmniXPU attention-routing. ComfyUI v0.35.0.
+#  De gepubliceerde tag intel/llm-scaler-omni:0.2.0-b1 heeft ComfyUI
+#  0.31 en géén sparse-attention; daarmee werken de b2-mounts ook, vandaag
+#  dat we beide padensets mounten.
+#
+#  Deze stack is specifiek voor MiniMax H3 video-generatie
+#  (T2V/I2V/V2V/R2V) met GGUF-quants. De tekst-encoder
+#  draait op CPU; de denoiser op GPU met AIMDO-staging.
+#
+#  Containernaam: comfyui_h3
+#  Poort: 8389 (vermijd conflict met video-stack op 8388)
+#
+#  VRAM-regel: alle andere GPU-stacks (LLM, image, video)
+#  MOETEN gestopt zijn vóór H3 draait. Zie lessons-learned.md.
+#
+#  Starten:
+#    docker compose -f compose.h3.yaml up -d
+#    -> http://<host>:8389
+#
+#  Stoppen (VRAM vrijgeven):
+#    docker compose -f compose.h3.yaml down
+#
+#  Pre-flight checks: zie docs/ideas/minimax-h3-b580-setup.md
+# ============================================================
+
+services:
+
+  comfyui_h3:
+    image: ${H3_IMAGE:-intel/llm-scaler-omni:0.2.0-b2-comfyui-bmg}
+    container_name: comfyui_h3
+    restart: unless-stopped
+
+    # ── GPU-toegang (gehard, i.p.v. Intel's --privileged) ────
+    # Intel's eigen voorbeeld gebruikt --privileged zonder verdere
+    # capability-configuratie. Wij gebruiken de bewezen geharde
+    # aanpak uit compose.video.yaml. Mocht GPU-detectie faalen,
+    # val dan terug op privileged: true als isolatie-stap.
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+
+    # ── Netwerk: bridge met poort-mapping ────────────────────
+    # Intel's eigen voorbeeld gebruikt --network=host. Wij
+    # gebruiken bridge in lijn met de andere stacks. Mocht er
+    # iets raars gebeuren met GPU-detectie of interne networking,
+    # val dan terug op network_mode: host.
+    ports:
+      - "${H3_PORT:-8389}:8188"
+
+    # ── Environment ───────────────────────────────────────────
+    environment:
+      # Minimale SYCL env (bewezen stabiel, zie lessons-learned.md)
+      - ONEAPI_DEVICE_SELECTOR=level_zero:0
+      - ZES_ENABLE_SYSMAN=1
+
+      # AIMDO/DynamicVRAM VRAM-reserve. Standaard 4 GiB — verhoog
+      # in stappen van 2 GiB als je OOM's ziet in Dozzle-logs,
+      # verlaag alleen als de workflow binnen VRAM past.
+      - OMNI_COMFYUI_RESERVE_VRAM_GB=${H3_RESERVE_VRAM_GB:-4}
+
+      # OmniXPU provider routing: auto = gebruik beschikbare
+      # XPU-providers, sla incompatibele over zonder te crashen
+      - OMNIXPU_PROVIDER_BOOTSTRAP=auto
+
+      # Attention backend: auto laat OmniXPU het beste pad
+      # kiezen (CUTE op B60/B70, torch/ESIMD fallback op B580)
+      - OMNI_ATTN_BACKEND=auto
+
+      # Diagnostics: zet op 1 voor dispatch/fallback-logging
+      - OMNIXPU_DEBUG_VERBOSE=${H3_DEBUG:-0}
+
+    # ── Volumes ───────────────────────────────────────────────
+    # 0.2.0-b1 heeft geen comfyui_host_models.yaml (dat is 0.2.0-b2).
+    # Modellen worden direct in /llm/ComfyUI/models/ gemount.
+    # Input/output/user ook direct in de ComfyUI-mappen.
+    volumes:
+      # ── b1 (ComfyUI 0.31) paden: directe /llm/ComfyUI/... mounts ──
+      # Modellen: GGUF-quants, VAEs, text encoders
+      - ${MODELS_DIR_H3:-/home/dennis/docker/comfyui_h3/models}:/llm/ComfyUI/models
+      # Input (afbeeldingen voor I2V, referenties voor R2V)
+      - ${INPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/input}:/llm/ComfyUI/input
+      # Output (gegenereerde video's)
+      - ${OUTPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/output}:/llm/ComfyUI/output
+      # User data (workflows, settings)
+      - ${USER_DIR_H3:-/home/dennis/docker/comfyui_h3/user}:/llm/ComfyUI/user
+
+      # ── b2 (ComfyUI 0.35) paden: extra-model-paths + /data/... mounts ──
+      # b2 start met --extra-model-paths-config /llm/configs/comfyui_host_models.yaml
+      # en --user-directory /data/user --input-directory /data/input
+      # --output-directory /data/output. Zelfde host-mappen, andere containerpaden.
+      - ${MODELS_DIR_H3:-/home/dennis/docker/comfyui_h3/models}:/models/host:ro
+      - ${INPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/input}:/data/input
+      - ${OUTPUT_DIR_H3:-/home/dennis/docker/comfyui_h3/output}:/data/output
+      - ${USER_DIR_H3:-/home/dennis/docker/comfyui_h3/user}:/data/user
+      # Custom nodes (host-bind-mount; overleeft container-recreate).
+      # rgthree-comfy is vereist door de H3-GGUF-T2V workflow
+      # (Any Switch, Power Lora Loader, Fast Bypasser). Installeren via
+      # scripts/setup_h3_custom_nodes.sh. Per-node bind-mount i.p.v. de
+      # hele custom_nodes-map shadowt de gebundelde nodes niet.
+      - ${CUSTOM_NODES_DIR_H3:-/home/dennis/docker/comfyui_h3/custom_nodes}/rgthree-comfy:/llm/ComfyUI/custom_nodes/rgthree-comfy
+      # Latent Upscaler custom node (test 8 sep 2026): nodes
+      # "Minimax H3 Latent Upscaler (2D)/(3D)" voor latente video-upscale
+      # i.p.v. de SeedVR2-stack. Installeren via scripts/setup_h3_custom_nodes.sh.
+      - ${CUSTOM_NODES_DIR_H3:-/home/dennis/docker/comfyui_h3/custom_nodes}/Comfyui_Minimax_h3_latent_Upscaler:/llm/ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler
+      # Larryvrh ComfyUI-MiniMax-H3-Turbo (test 10 sep 2026): Turbo Sampler +
+      # Turbo LoRA-node voor de v4-step600-EMA LoRA-test. Fallback voor als de
+      # gewone LoraLoaderModelOnly-route problemen geeft op GGUF/Kitchen-XPU.
+      # Installeren via scripts/setup_h3_custom_nodes.sh.
+      - ${CUSTOM_NODES_DIR_H3:-/home/dennis/docker/comfyui_h3/custom_nodes}/ComfyUI-MiniMax-H3-Turbo:/llm/ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-Turbo
+      # Herrgott's H3 Infinite Continuation Suite v1.4 (test 18 sep 2026):
+      # native Masked AV-continuation (ComfyUI PR #15375, beschikbaar sinds
+      # v0.34.0 — onze b2-image draait 0.35.0) voor langere video's uit
+      # naadloos geketende clips. Installeren via scripts/setup_h3_custom_nodes.sh.
+      - ${CUSTOM_NODES_DIR_H3:-/home/dennis/docker/comfyui_h3/custom_nodes}/Herrgotts-H3-Infinite-Continuation-Suite:/llm/ComfyUI/custom_nodes/Herrgotts-H3-Infinite-Continuation-Suite
+
+    # ── Entrypoint ────────────────────────────────────────────
+    # Intel's entrypoint activeert DynamicVRAM (--enable-dynamic-vram)
+    # met --reserve-vram, en activeert Node Manager. Essentieel voor
+    # H3 op 12 GB VRAM — zonder DynamicVRAM past het model niet.
+    # Het entrypoint luistert op 0.0.0.0:8188.
+    # umask 000: de image draait als root, dus output-bestanden zijn
+    # root-owned. umask 000 maakt ze wereld-beschrijfbaar (0666/0777)
+    # zodat FileBrowser (UID 1000) ze kan verwijderen zonder chown.
+    entrypoint: ["sh", "-c", "umask 000 && exec /llm/entrypoints/start_comfyui.sh"]
+
+    # ── Shared memory ─────────────────────────────────────────
+    # Intel's voorbeeld gebruikt 64g. Met 32 GB RAM is dat een
+    # plafond, geen reservering. Begin op 16g — verhoog alleen
+    # bij shared-memory-fouten in de logs.
+    shm_size: "${H3_SHM_SIZE:-16g}"
+
+    # ── Logging ───────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8188/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+networks:
+  default:
+    driver: bridge
