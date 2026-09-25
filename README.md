@@ -571,6 +571,6 @@ docs/
 
 ---
 
-*Cookbook based on the Nighthunter production rig (September 2026). Timings
+*Cookbook based on the my rig (September 2026). Timings
 are wall-clock on that specific machine — treat them as an order of
 magnitude, not a guarantee for your host.*
